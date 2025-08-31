@@ -1,0 +1,365 @@
+<!--
+README (quick):
+1) This is a full, single‑file starter for a Real‑Time Sign‑Language→Text translator.
+2) It uses MediaPipe Hands (fast hand landmarks in-browser) + optional TensorFlow.js classifier (drop your Teachable Machine model in MODEL_URL).
+3) Extras: text-to-speech toggle, prediction smoothing, assemble letters→words, simple UI, and hooks for chatbot/backend.
+4) To run locally with camera permissions: start a local server.
+   - Python:    python -m http.server 8000
+   - Node:      npx serve .
+   - Then open: http://localhost:8000
+5) To integrate your Teachable Machine (TM) model:
+   - Export your image model from TM. Host the exported folder (contains model.json, weights.bin, metadata.json) in /tm-model/ or any URL.
+   - Set const MODEL_URL = "/tm-model/model.json" (or a full URL) below.
+   - Adjust INPUT_SIZE if your model expects different resolution (TM default 224x224).
+6) No model yet? This file includes a tiny heuristic fallback (Fist/Open‑Palm/Thumbs‑Up) using landmarks so you can demo without a trained model.
+7) Optional backend hooks included (commented). See the bottom of this file for a minimal Flask API you can run separately.
+-->
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Real‑Time Sign Language → Text</title>
+  <style>
+    :root{
+      --bg:#0b1020; --card:#111831; --ink:#e8ecff; --muted:#a8b0d9; --acc:#6ea8fe;
+    }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:Inter,system-ui,Segoe UI,Roboto,Arial; background:var(--bg); color:var(--ink);}
+    header{padding:18px 20px; display:flex; align-items:center; gap:14px; border-bottom:1px solid #1f2747; position:sticky; top:0; background:linear-gradient(180deg,var(--bg),rgba(11,16,32,0.9)); backdrop-filter: blur(6px);}
+    header h1{font-size:18px; margin:0; letter-spacing:.3px}
+    main{max-width:1100px; margin:30px auto; padding:0 16px; display:grid; grid-template-columns:1.2fr .8fr; gap:20px}
+    .panel{background:var(--card); border:1px solid #1f2747; border-radius:20px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    .videoWrap{position:relative; border-radius:16px; overflow:hidden;}
+    video, canvas{display:block; width:100%; height:auto;}
+    canvas{position:absolute; inset:0}
+    .controls{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px}
+    button, .toggle{
+      padding:10px 12px; background:#0f1730; color:var(--ink); border:1px solid #243158; border-radius:12px; cursor:pointer; font-weight:600; transition:.15s ease;}
+    button:hover, .toggle:hover{transform:translateY(-1px); border-color:#3450a1}
+    .toggle input{accent-color:var(--acc);}
+    .readout{min-height:120px; padding:12px; border:1px dashed #2a355f; border-radius:12px; background:#0e162e; font-size:18px; line-height:1.5}
+    .pill{display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px; background:#0c1430; border:1px solid #22305a; font-size:12px; color:var(--muted)}
+    .small{font-size:12px;color:var(--muted)}
+    .kbd{font-family:ui-monospace,Menlo,Consolas,monospace; background:#0c1430; border:1px solid #22305a; padding:2px 6px; border-radius:6px}
+    .row{display:flex; align-items:center; justify-content:space-between; gap:10px;}
+    .grid{display:grid; grid-template-columns:repeat(2,1fr); gap:12px}
+    .hint{margin-top:8px; color:var(--muted); font-size:13px}
+  </style>
+</head>
+<body>
+  <header>
+    <span class="pill">RT‑SL ↦ Text</span>
+    <h1>Real‑Time Sign Language → Text Translator</h1>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="videoWrap">
+        <video id="video" autoplay playsinline muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="controls">
+        <button id="btnStart">Start Camera</button>
+        <button id="btnStop">Stop</button>
+        <button id="btnClear">Clear</button>
+        <button id="btnCopy">Copy Text</button>
+        <label class="toggle"><input type="checkbox" id="ttsToggle" checked/> Text‑to‑Speech</label>
+        <label class="toggle"><input type="checkbox" id="smoothToggle" checked/> Smooth Predictions</label>
+      </div>
+      <div class="hint">Tip: Use a plain background & good lighting. Hold signs ~1s steady.</div>
+    </section>
+
+    <section class="panel">
+      <div class="row"><h3 style="margin:0">Output</h3><span class="small">Press <span class="kbd">C</span> to insert space • <span class="kbd">Backspace</span> to delete</span></div>
+      <div id="readout" class="readout" contenteditable="true" spellcheck="false" aria-label="Recognized text area"></div>
+      <div class="grid" style="margin-top:12px">
+        <button id="btnSpeak">Speak</button>
+        <button id="btnSendChat">Send to Chatbot</button>
+      </div>
+      <div class="hint">Chatbot endpoint is configurable in code (see CHATBOT_URL). Backend is optional.</div>
+    </section>
+  </main>
+
+  <!-- Libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.19.0/dist/tf.min.js"></script>
+
+  <script>
+    // ====== Config ======
+    const MODEL_URL = null; // e.g., "/tm-model/model.json" OR full URL. Keep null to use heuristic fallback.
+    const INPUT_SIZE = 224; // Teachable Machine default. Change if your model differs.
+    const PREDICTION_INTERVAL_MS = 120; // throttle model calls
+    const SMOOTH_WINDOW = 7; // rolling window for majority vote
+    const MIN_CONFIDENCE = 0.75; // confidence gate for TM models
+    const CHATBOT_URL = null; // e.g., "http://localhost:5000/chat" (see Flask snippet below)
+
+    // ====== DOM & State ======
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('overlay');
+    const ctx = canvas.getContext('2d');
+    const readout = document.getElementById('readout');
+
+    const btnStart = document.getElementById('btnStart');
+    const btnStop = document.getElementById('btnStop');
+    const btnClear = document.getElementById('btnClear');
+    const btnCopy = document.getElementById('btnCopy');
+    const btnSpeak = document.getElementById('btnSpeak');
+    const btnSendChat = document.getElementById('btnSendChat');
+    const ttsToggle = document.getElementById('ttsToggle');
+    const smoothToggle = document.getElementById('smoothToggle');
+
+    let camera = null;
+    let hands = null;
+    let model = null;
+    let lastPredTime = 0;
+    let smoothQueue = [];
+    let classLabels = null; // filled from TM metadata if available
+
+    // ====== Utils ======
+    function speak(text){
+      if(!('speechSynthesis' in window)) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    }
+    function majority(arr){
+      const m = new Map();
+      for(const a of arr){ m.set(a,(m.get(a)||0)+1); }
+      let best=null, cnt=0;
+      m.forEach((v,k)=>{ if(v>cnt){cnt=v;best=k;} });
+      return best;
+    }
+    function now(){ return performance.now(); }
+    function setReadoutAppend(ch){
+      readout.textContent += ch;
+      readout.scrollTop = readout.scrollHeight;
+      if(ttsToggle.checked) speak(ch.length>1? ch : ch.toUpperCase());
+    }
+
+    // ====== Heuristic fallback (no TFJS model) ======
+    function classifyHeuristic(landmarks){
+      // Landmarks: 21 points; we check simple distances/angles
+      if(!landmarks || landmarks.length===0) return null;
+      const lm = landmarks[0];
+      // Compute average finger curl by comparing fingertip to base distance vs hand size
+      const tips = [8,12,16,20]; // index, middle, ring, pinky tips
+      const bases = [5,9,13,17];
+      const wrist = lm[0];
+      const handScale = Math.hypot(lm[5].x - wrist.x, lm[5].y - wrist.y) + 1e-6;
+
+      let curl=0;
+      for(let i=0;i<4;i++){
+        const d = Math.hypot(lm[tips[i]].x-lm[bases[i]].x, lm[tips[i]].y-lm[bases[i]].y);
+        curl += d/handScale;
+      }
+      curl /= 4; // small curl => fist
+
+      // Thumb tip above/below index MCP for thumbs up/down
+      const thumbTip = lm[4];
+      const indexMCP = lm[5];
+
+      // Open palm if curl large
+      if(curl > 0.42) return {label:'OPEN', conf:0.9};
+      // Fist if curl small
+      if(curl < 0.28) return {label:'FIST', conf:0.9};
+      // Thumbs up if thumb above index MCP (in image coords, smaller y is up)
+      if(thumbTip.y < indexMCP.y && curl < 0.36) return {label:'THUMB_UP', conf:0.85};
+      return null;
+    }
+
+    // Map heuristic labels to characters (demo)
+    const HEURISTIC_MAP = {
+      'OPEN': 'A', // you can change
+      'FIST': 'B',
+      'THUMB_UP': 'C'
+    };
+
+    // ====== TFJS model helpers ======
+    async function loadTFModel(){
+      if(!MODEL_URL) return null;
+      const m = await tf.loadLayersModel(MODEL_URL);
+      // Try to fetch Teachable Machine metadata.json to get labels
+      try{
+        const metaUrl = MODEL_URL.replace(/model\.json$/, 'metadata.json');
+        const meta = await fetch(metaUrl).then(r=>r.json());
+        if(meta && meta.labels) classLabels = meta.labels; // TM stores an array of class names
+      }catch(e){ console.warn('No metadata.json found (labels will be indices).'); }
+      return m;
+    }
+
+    function topClass(prob){
+      let bestI = 0, bestP = prob[0];
+      for(let i=1;i<prob.length;i++) if(prob[i]>bestP){ bestP=prob[i]; bestI=i; }
+      return {index: bestI, conf: bestP, label: classLabels? (classLabels[bestI]||String(bestI)) : String(bestI)};
+    }
+
+    async function predictTM(videoEl){
+      if(!model) return null;
+      // Grab a square crop from the center to keep aspect consistent
+      const w = videoEl.videoWidth, h = videoEl.videoHeight;
+      const size = Math.min(w,h);
+      const sx = (w-size)/2, sy = (h-size)/2;
+      const tmp = document.createElement('canvas');
+      tmp.width = INPUT_SIZE; tmp.height = INPUT_SIZE;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(videoEl, sx, sy, size, size, 0, 0, INPUT_SIZE, INPUT_SIZE);
+      // TM image models usually expect [0,1] floats
+      const img = tf.browser.fromPixels(tmp).toFloat().div(255).expandDims(0);
+      const logits = model.predict(img);
+      const prob = (await logits.data());
+      tf.dispose([img, logits]);
+      const top = topClass(prob);
+      if(top.conf < MIN_CONFIDENCE) return null;
+      return {label: top.label, conf: top.conf};
+    }
+
+    // ====== MediaPipe setup ======
+    function setupHands(){
+      hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+      });
+      hands.onResults(onResults);
+    }
+
+    function startCamera(){
+      camera = new Camera(video, {
+        onFrame: async () => { await hands.send({image: video}); },
+        width: 640, height: 480
+      });
+      camera.start();
+    }
+
+    function stopCamera(){ if(camera){ camera.stop(); camera = null; } }
+
+    function resizeCanvas(){
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+    }
+
+    // ====== Main results callback ======
+    async function onResults(results){
+      resizeCanvas();
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      if(results.multiHandLandmarks && results.multiHandLandmarks.length){
+        for(const lm of results.multiHandLandmarks){
+          drawConnectors(ctx, lm, HAND_CONNECTIONS, {lineWidth:3});
+          drawLandmarks(ctx, lm, {radius:2});
+        }
+        // Throttle predictions
+        if(now() - lastPredTime > PREDICTION_INTERVAL_MS){
+          lastPredTime = now();
+          let pred = null;
+          // Prefer TFJS model if provided
+          if(model){ pred = await predictTM(video); }
+          if(!pred){ // fallback to heuristic
+            const h = classifyHeuristic(results.multiHandLandmarks);
+            if(h) pred = h;
+          }
+          if(pred){ handlePrediction(pred.label); }
+        }
+      }
+    }
+
+    function handlePrediction(label){
+      if(smoothToggle.checked){
+        smoothQueue.push(label);
+        if(smoothQueue.length > SMOOTH_WINDOW) smoothQueue.shift();
+        const maj = majority(smoothQueue);
+        if(maj) commitLabel(maj);
+      } else {
+        commitLabel(label);
+      }
+    }
+
+    function commitLabel(label){
+      // Map heuristic labels to characters if needed
+      if(!model && HEURISTIC_MAP[label]) label = HEURISTIC_MAP[label];
+      // If label looks like special tokens from TM (e.g., 'space')
+      const lower = String(label).toLowerCase().trim();
+      if(lower === 'space' || lower === '_') return setReadoutAppend(' ');
+      if(lower === 'del' || lower === 'delete' || lower === 'backspace'){
+        readout.textContent = readout.textContent.slice(0,-1);
+        return;
+      }
+      // Append single character; if your classes are words, they'll append whole words
+      if(label.length === 1){ setReadoutAppend(label); }
+      else { setReadoutAppend(label + ' '); }
+    }
+
+    // ====== UI handlers ======
+    btnStart.addEventListener('click', async ()=>{
+      if(!hands) setupHands();
+      if(!model && MODEL_URL){ model = await loadTFModel(); }
+      // Request camera
+      const stream = await navigator.mediaDevices.getUserMedia({video:true, audio:false});
+      video.srcObject = stream;
+      await video.play();
+      startCamera();
+    });
+
+    btnStop.addEventListener('click', ()=>{
+      stopCamera();
+      const s = video.srcObject; if(s){ s.getTracks().forEach(t=>t.stop()); video.srcObject=null; }
+    });
+
+    btnClear.addEventListener('click', ()=>{ readout.textContent=''; smoothQueue.length=0; });
+    btnCopy.addEventListener('click', async ()=>{
+      await navigator.clipboard.writeText(readout.textContent);
+      btnCopy.textContent = 'Copied!'; setTimeout(()=>btnCopy.textContent='Copy Text', 900);
+    });
+    btnSpeak.addEventListener('click', ()=>{ speak(readout.textContent.trim()); });
+
+    // Keyboard helpers
+    document.addEventListener('keydown', (e)=>{
+      if(e.key==='c' || e.key==='C'){ setReadoutAppend(' '); }
+      if(e.key==='Backspace'){ readout.textContent = readout.textContent.slice(0,-1); }
+    });
+
+    // Chatbot hook (optional)
+    btnSendChat.addEventListener('click', async ()=>{
+      if(!CHATBOT_URL){ alert('Set CHATBOT_URL in code to enable chatbot.'); return; }
+      const text = readout.textContent.trim();
+      try{
+        const res = await fetch(CHATBOT_URL, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+        const data = await res.json();
+        alert('Chatbot says: ' + (data.reply || JSON.stringify(data)));
+      }catch(err){ alert('Chatbot error: '+ err.message); }
+    });
+  </script>
+
+  <!-- ================== OPTIONAL BACKEND (Flask) ==================
+Create a "backend" folder and put this as app.py. Then:
+  pip install flask flask-cors mediapipe==0.10.15 opencv-python
+  python app.py
+This basic API echoes your text and can be extended for server-side sign inference if you want.
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+app = Flask(__name__)
+CORS(app)
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.get_json(force=True)
+    text = data.get('text','')
+    # TODO: integrate a chatbot here (e.g., rule-based, local model, or external API)
+    reply = f"You said: {text}. I am a simple bot!"
+    return jsonify({"reply": reply})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=True)
+
+--- Server-side MediaPipe example (optional):
+If you want to POST frames to the server for classification, create another route like /classify that accepts a base64 image, runs MediaPipe Hands+your classifier, and returns a label. For a 3‑day build, in‑browser is faster.
+  -->
+</body>
+</html>
